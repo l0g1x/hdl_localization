@@ -230,7 +230,8 @@ private:
    */
   void publish_odometry(const ros::Time& stamp, const Eigen::Matrix4f& pose) {
     // broadcast the transform over tf
-    geometry_msgs::TransformStamped odom_trans = matrix2transform(stamp, pose, "map", "velodyne");
+    //geometry_msgs::TransformStamped odom_trans = matrix2transform(stamp, pose, "map", "sensor2/os1_sensor");
+    geometry_msgs::TransformStamped odom_trans = matrix2transform(stamp, pose, "map", "odom");
     pose_broadcaster.sendTransform(odom_trans);
 
     // publish the transform
@@ -243,7 +244,7 @@ private:
     odom.pose.pose.position.z = pose(2, 3);
     odom.pose.pose.orientation = odom_trans.transform.rotation;
 
-    odom.child_frame_id = "velodyne";
+    odom.child_frame_id = "odom";
     odom.twist.twist.linear.x = 0.0;
     odom.twist.twist.linear.y = 0.0;
     odom.twist.twist.angular.z = 0.0;
