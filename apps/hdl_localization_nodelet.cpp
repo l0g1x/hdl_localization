@@ -7,6 +7,12 @@
 #include <pcl_ros/point_cloud.h>
 #include <tf_conversions/tf_eigen.h>
 #include <tf/transform_broadcaster.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_sensor_msgs/tf2_sensor_msgs.h>
+#include <message_filters/subscriber.h>
+#include <message_filters/synchronizer.h>
+#include <message_filters/time_synchronizer.h>
+#include <message_filters/sync_policies/approximate_time.h>
 
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/Imu.h>
@@ -29,9 +35,11 @@ class HdlLocalizationNodelet : public nodelet::Nodelet {
 public:
   using PointT = pcl::PointXYZI;
 
-  HdlLocalizationNodelet() {
+  HdlLocalizationNodelet(): tfListener(tfBuffer)
+  {
   }
-  virtual ~HdlLocalizationNodelet() {
+  virtual ~HdlLocalizationNodelet()
+  {
   }
 
 
@@ -53,8 +61,17 @@ public:
     globalmap_sub = nh.subscribe("/globalmap", 1, &HdlLocalizationNodelet::globalmap_callback, this);
     initialpose_sub = nh.subscribe("/initialpose", 8, &HdlLocalizationNodelet::initialpose_callback, this);
 
+    left_cloud_sub.reset(new message_filters::Subscriber<sensor_msgs::PointCloud2>(mt_nh, "/left/points", 32));
+    right_cloud_sub.reset(new message_filters::Subscriber<sensor_msgs::PointCloud2>(mt_nh, "/right/points", 32));
+    //typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::PointCloud2, sensor_msgs::PointCloud2> MySyncPolicy;
+    //Synchronizer<MySyncPolicy> sync(MySyncPolicy(10), image1_sub, image2_sub);
+    sync.reset(new message_filters::Synchronizer<MySyncPolicy>(MySyncPolicy(10), *left_cloud_sub, *right_cloud_sub));
+    sync->registerCallback(boost::bind(&HdlLocalizationNodelet::cloud_callback, this, _1, _2));
+
+
     pose_pub = nh.advertise<nav_msgs::Odometry>("/odom", 5, false);
     aligned_pub = nh.advertise<sensor_msgs::PointCloud2>("/aligned_points", 5, false);
+
   }
 
 private:
@@ -126,9 +143,28 @@ private:
       return;
     }
 
+    sensor_msgs::PointCloud2 cloud_bl = tfBuffer.transform(*points_msg, "base_link", ros::Duration(2.0));
+
     const auto& stamp = points_msg->header.stamp;
     pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());
-    pcl::fromROSMsg(*points_msg, *cloud);
+    pcl::fromROSMsg(cloud_bl, *cloud);
+
+/*
+    geometry_msgs::TransformStamped transformStamped;
+    try
+    {
+        transformStamped = tfBuffer.lookupTransform("base_link", points_msg->header.frame_id, ros::Time(0));
+        std::cout << transformStamped << std::endl;
+        tf2::doTransform(cloud, cloud_out, transformStamped);
+        //pcl_ros::transformPointCloud("robotarm", cloud_in, cloud_out, tfListener);
+    }
+    catch (tf2::TransformException &ex)
+    {
+        ROS_ERROR("%s", ex.what());
+        ros::Duration(1.0).sleep();
+        return;
+    }
+*/
 
     if(cloud->empty()) {
       NODELET_ERROR("cloud is empty!!");
@@ -171,6 +207,84 @@ private:
     }
 
     publish_odometry(points_msg->header.stamp, pose_estimator->matrix());
+  }
+
+  /**
+   * @brief callback for synchronized pointclouds from 2 lidars
+   * @param points_msg
+   */
+  void cloud_callback(const sensor_msgs::PointCloud2::ConstPtr& left_cloud_msg, const sensor_msgs::PointCloud2::ConstPtr& right_cloud_msg)
+  {
+    std::lock_guard<std::mutex> estimator_lock(pose_estimator_mutex);
+    if(!pose_estimator) {
+      NODELET_ERROR("waiting for initial pose input!!");
+      return;
+    }
+
+    if(!globalmap) {
+      NODELET_ERROR("globalmap has not been received!!");
+      return;
+    }
+    //NODELET_INFO("SYNCED");
+    sensor_msgs::PointCloud2 leftcloud_bl = tfBuffer.transform(*left_cloud_msg, "base_link", ros::Duration(2.0));
+    sensor_msgs::PointCloud2 rightcloud_bl = tfBuffer.transform(*right_cloud_msg, "base_link", ros::Duration(2.0));
+
+    const auto& stamp1 = left_cloud_msg->header.stamp;
+    //pcl::PointCloud<PointT>::Ptr leftcloud(new pcl::PointCloud<PointT>());
+    pcl::PointCloud<PointT> leftcloud;
+    pcl::fromROSMsg(leftcloud_bl, leftcloud);
+
+    const auto& stamp2 = right_cloud_msg->header.stamp;
+    //pcl::PointCloud<PointT>::Ptr rightcloud(new pcl::PointCloud<PointT>());
+    pcl::PointCloud<PointT> rightcloud;
+    pcl::fromROSMsg(rightcloud_bl, rightcloud);
+
+    pcl::PointCloud<PointT>::Ptr cloud(new pcl::PointCloud<PointT>());
+    *cloud += leftcloud;
+    *cloud += rightcloud;
+
+    if(cloud->empty()) {
+      NODELET_ERROR("cloud is empty!!");
+      return;
+    }
+
+    auto filtered = downsample(cloud);
+
+    // predict
+    if(!use_imu) {
+      pose_estimator->predict(stamp1, Eigen::Vector3f::Zero(), Eigen::Vector3f::Zero());
+    } else {
+      std::lock_guard<std::mutex> lock(imu_data_mutex);
+      auto imu_iter = imu_data.begin();
+      for(imu_iter; imu_iter != imu_data.end(); imu_iter++) {
+        if(stamp1 < (*imu_iter)->header.stamp) {
+          break;
+        }
+        const auto& acc = (*imu_iter)->linear_acceleration;
+        const auto& gyro = (*imu_iter)->angular_velocity;
+        double gyro_sign = invert_imu ? -1.0 : 1.0;
+        pose_estimator->predict((*imu_iter)->header.stamp, Eigen::Vector3f(acc.x, acc.y, acc.z), gyro_sign * Eigen::Vector3f(gyro.x, gyro.y, gyro.z));
+      }
+      imu_data.erase(imu_data.begin(), imu_iter);
+    }
+
+    // correct
+    auto t1 = ros::WallTime::now();
+    auto aligned = pose_estimator->correct(filtered);
+    auto t2 = ros::WallTime::now();
+
+    processing_time.push_back((t2 - t1).toSec());
+    double avg_processing_time = std::accumulate(processing_time.begin(), processing_time.end(), 0.0) / processing_time.size();
+    // NODELET_INFO_STREAM("processing_time: " << avg_processing_time * 1000.0 << "[msec]");
+
+    if(aligned_pub.getNumSubscribers()) {
+      aligned->header.frame_id = "map";
+      aligned->header.stamp = cloud->header.stamp;
+      aligned_pub.publish(aligned);
+    }
+
+    publish_odometry(stamp1, pose_estimator->matrix());
+
   }
 
   /**
@@ -244,7 +358,7 @@ private:
     odom.pose.pose.position.z = pose(2, 3);
     odom.pose.pose.orientation = odom_trans.transform.rotation;
 
-    odom.child_frame_id = "odom";
+    odom.child_frame_id = "base_link";
     odom.twist.twist.linear.x = 0.0;
     odom.twist.twist.linear.y = 0.0;
     odom.twist.twist.angular.z = 0.0;
@@ -295,9 +409,21 @@ private:
   ros::Subscriber globalmap_sub;
   ros::Subscriber initialpose_sub;
 
+  std::unique_ptr<message_filters::Subscriber<nav_msgs::Odometry>> odom_sub;
+  std::unique_ptr<message_filters::Subscriber<sensor_msgs::PointCloud2>> left_cloud_sub;
+  std::unique_ptr<message_filters::Subscriber<sensor_msgs::PointCloud2>> right_cloud_sub;
+  typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::PointCloud2, sensor_msgs::PointCloud2> MySyncPolicy;
+  std::unique_ptr<message_filters::Synchronizer<MySyncPolicy>> sync;
+
+
+
   ros::Publisher pose_pub;
   ros::Publisher aligned_pub;
   tf::TransformBroadcaster pose_broadcaster;
+
+  tf2_ros::Buffer tfBuffer;
+  tf2_ros::TransformListener tfListener;
+  sensor_msgs::PointCloud2 cloud_in, cloud_out;
 
   // imu input buffer
   std::mutex imu_data_mutex;

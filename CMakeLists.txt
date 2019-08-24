@@ -16,6 +16,8 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   sensor_msgs
   ndt_omp
+  tf2
+  tf2_ros
 )
 
 find_package(PCL 1.7 REQUIRED)
